@@ -15,6 +15,35 @@ import {
   TRACKING_GRACE_MS,
 } from "@/lib/air-draw";
 
+// MediaPipe Hands is a classic (non-ES-module) script that attaches `Hands` to
+// `window`. Importing it as a module gives an undefined export once bundled
+// ("u is not a constructor"), so load the self-hosted script and read the global.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let handsScriptPromise: Promise<any> | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function loadHandsConstructor(): Promise<new (config: { locateFile: (file: string) => string }) => any> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const existing = (window as any).Hands;
+  if (typeof existing === "function") return Promise.resolve(existing);
+  if (!handsScriptPromise) {
+    handsScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "/mediapipe/hands/hands.js";
+      script.async = true;
+      script.onload = () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ctor = (window as any).Hands;
+        if (typeof ctor === "function") resolve(ctor);
+        else reject(new Error("Hand tracking failed to load. Please refresh and try again."));
+      };
+      script.onerror = () => reject(new Error("Hand tracking files could not be loaded. Please refresh and try again."));
+      document.head.appendChild(script);
+    }).catch((err) => { handsScriptPromise = null; throw err; });
+  }
+  return handsScriptPromise;
+}
+
+
 type Mode = "draw" | "free";
 type Status = "idle" | "starting" | "ready" | "error";
 type Stroke = { points: Point[] };
@@ -219,8 +248,8 @@ function AirDraw() {
       });
       await video.play();
 
-      const { Hands } = await import("@mediapipe/hands");
-      const tracker = new Hands({ locateFile: (file) => `/mediapipe/hands/${file}` });
+      const Hands = await loadHandsConstructor();
+      const tracker = new Hands({ locateFile: (file: string) => `/mediapipe/hands/${file}` });
       tracker.setOptions({ maxNumHands: 1, modelComplexity: 0, selfieMode: false, minDetectionConfidence: 0.62, minTrackingConfidence: 0.58 });
       tracker.onResults((results) => handleLandmarks(results.multiHandLandmarks[0]));
       await tracker.initialize();
