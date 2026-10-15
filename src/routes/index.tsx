@@ -65,22 +65,26 @@ export const Route = createFileRoute("/")({
 
 
 type TrackerResults = { multiHandLandmarks?: Point[][] };
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let sharedTrackerPromise: Promise<any> | null = null;
+type AirDrawWindow = Window & {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  __airDrawTracker?: Promise<any> | null;
+  __airDrawEngineBroken?: boolean;
+};
 let sharedResultsHandler: ((landmarks: Point[] | undefined) => void) | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function getSharedTracker(): Promise<any> {
-  if (!sharedTrackerPromise) {
-    sharedTrackerPromise = (async () => {
+  const w = window as AirDrawWindow;
+  if (!w.__airDrawTracker) {
+    w.__airDrawTracker = (async () => {
       const Hands = await loadHandsConstructor();
       const tracker = new Hands({ locateFile: (file: string) => `/mediapipe/hands/${file}` });
       tracker.setOptions({ maxNumHands: 1, modelComplexity: 0, selfieMode: false, minDetectionConfidence: 0.62, minTrackingConfidence: 0.58 });
       tracker.onResults((results: TrackerResults) => sharedResultsHandler?.(results.multiHandLandmarks?.[0]));
       await tracker.initialize();
       return tracker;
-    })().catch((err) => { sharedTrackerPromise = null; throw err; });
+    })().catch((err) => { w.__airDrawTracker = null; w.__airDrawEngineBroken = true; throw err; });
   }
-  return sharedTrackerPromise;
+  return w.__airDrawTracker;
 }
 
 const EMPTY_OFFSET: FlyingOffset = { x: 0, y: 0, vx: 0, vy: 0 };
@@ -244,6 +248,12 @@ function AirDraw() {
   }, [getDrawingBounds]);
 
   const startCamera = useCallback(async () => {
+    // The MediaPipe engine can't recover from a crash inside one page load, so reload.
+    if ((window as AirDrawWindow).__airDrawEngineBroken) { window.location.reload(); return; }
+    if (frameRef.current !== null) { cancelAnimationFrame(frameRef.current); frameRef.current = null; }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    inFlightRef.current = false;
     setStatus("starting");
     setMessage("");
     setHandVisible(false);
@@ -293,8 +303,14 @@ function AirDraw() {
         if (liveVideo && activeTracker && liveVideo.readyState >= 2 && liveVideo.currentTime !== lastVideoTimeRef.current && !inFlightRef.current) {
           lastVideoTimeRef.current = liveVideo.currentTime;
           inFlightRef.current = true;
-          void activeTracker.send({ image: liveVideo }).catch(() => {
-            setMessage("Hand tracking paused. Retry to reconnect the camera.");
+          void activeTracker.send({ image: liveVideo }).catch((err: unknown) => {
+            console.error("[air-draw] hand tracking failed", err);
+            (window as AirDrawWindow).__airDrawEngineBroken = true;
+            if (frameRef.current !== null) { cancelAnimationFrame(frameRef.current); frameRef.current = null; }
+            streamRef.current?.getTracks().forEach((track) => track.stop());
+            streamRef.current = null;
+            const detail = err instanceof Error ? err.message : String(err);
+            setMessage(`Hand tracking stopped (${detail.slice(0, 120)}). Press Retry to reload and reconnect the camera.`);
             setStatus("error");
           }).finally(() => { inFlightRef.current = false; });
         }
@@ -302,11 +318,14 @@ function AirDraw() {
       };
       frameRef.current = requestAnimationFrame(animate);
     } catch (error) {
+      console.error("[air-draw] start failed", error);
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       setStatus("error");
       const name = error instanceof Error ? error.name : "";
-      setMessage(name === "NotAllowedError" || name === "PermissionDeniedError"
+      setMessage(name === "NotReadableError" || name === "TrackStartError"
+        ? "The camera is being used by another app or tab. Close it, then try again."
+        : name === "NotAllowedError" || name === "PermissionDeniedError"
         ? "Camera access is off. Allow camera access in Chrome, then try again."
         : name === "NotFoundError" || name === "DevicesNotFoundError"
           ? "No camera was found. Connect a camera, then try again."
