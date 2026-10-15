@@ -8,3 +8,5 @@
 > Commits you push to the connected branch sync back to Lovable and show up in
 > the editor, so keep the branch in a working state.
 <!-- LOVABLE:END -->
+
+- Keep Air Draw camera handling, tracking, strokes, and physics entirely in the browser; self-host pinned tracking assets so camera frames never leave the device.
