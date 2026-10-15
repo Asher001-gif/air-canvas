@@ -105,6 +105,7 @@ function AirDraw() {
   const lastFrameTimeRef = useRef(0);
   const lastVideoTimeRef = useRef(-1);
   const inFlightRef = useRef(false);
+  const cursorRef = useRef<{ point: Point; drawing: boolean } | null>(null);
   const dragRef = useRef<{ point: Point; time: number; vx: number; vy: number } | null>(null);
   const [mode, setMode] = useState<Mode>("draw");
   const [status, setStatus] = useState<Status>("idle");
@@ -158,6 +159,17 @@ function AirDraw() {
       context.stroke();
     }
     context.restore();
+    const cursor = cursorRef.current;
+    if (cursor) {
+      context.save();
+      context.shadowBlur = 0;
+      context.lineWidth = 2;
+      context.strokeStyle = cursor.drawing ? "#7dffb2" : "rgba(255,255,255,0.75)";
+      context.beginPath();
+      context.arc(cursor.point.x, cursor.point.y, cursor.drawing ? 7 : 10, 0, Math.PI * 2);
+      context.stroke();
+      context.restore();
+    }
   }, []);
 
   const getDrawingBounds = useCallback((): DrawingBounds | null => {
@@ -180,6 +192,7 @@ function AirDraw() {
   const handleLandmarks = useCallback((landmarks: Point[] | undefined) => {
     const now = performance.now();
     if (!landmarks || landmarks.length < 21) {
+      cursorRef.current = null;
       setHandVisible(false);
       if (drawingRef.current && !isWithinTrackingGrace(lastSeenRef.current, now)) {
         drawingRef.current = false;
@@ -198,7 +211,23 @@ function AirDraw() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const point = { x: (1 - tip.x) * rect.width, y: tip.y * rect.height };
+    // The <video> uses object-fit: cover and is mirrored with CSS, so map the
+    // fingertip through the same crop + flip to land exactly under your finger.
+    const video = videoRef.current;
+    const vw = video?.videoWidth || 0;
+    const vh = video?.videoHeight || 0;
+    let point: Point;
+    if (vw && vh && rect.width && rect.height) {
+      const scale = Math.max(rect.width / vw, rect.height / vh);
+      const shownW = vw * scale;
+      const shownH = vh * scale;
+      const offsetX = (rect.width - shownW) / 2;
+      const offsetY = (rect.height - shownH) / 2;
+      point = { x: rect.width - (tip.x * shownW + offsetX), y: tip.y * shownH + offsetY };
+    } else {
+      point = { x: (1 - tip.x) * rect.width, y: tip.y * rect.height };
+    }
+    cursorRef.current = { point, drawing: false };
 
     if (modeRef.current === "draw") {
       const extended = indexFingerIsExtended(landmarks);
@@ -224,6 +253,7 @@ function AirDraw() {
       }
       lastSeenRef.current = now;
       lastPointRef.current = point;
+      if (cursorRef.current) cursorRef.current.drawing = true;
       return;
     }
 

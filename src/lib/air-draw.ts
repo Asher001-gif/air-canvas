@@ -17,9 +17,15 @@ export type DrawingBounds = {
 export const TRACKING_GRACE_MS = 150;
 
 export function indexFingerIsExtended(landmarks: Point[]) {
+  const wrist = landmarks[0];
   const tip = landmarks[8];
   const middleJoint = landmarks[6];
-  return Boolean(tip && middleJoint && tip.y < middleJoint.y - 0.025);
+  if (!wrist || !tip || !middleJoint) return false;
+  // Orientation-independent: an extended index fingertip is clearly farther from
+  // the wrist than its middle joint; a folded one is closer to the palm.
+  const tipDistance = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+  const jointDistance = Math.hypot(middleJoint.x - wrist.x, middleJoint.y - wrist.y);
+  return tipDistance > jointDistance * 1.12;
 }
 
 export function isPinching(landmarks: Point[]) {
