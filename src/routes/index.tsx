@@ -63,6 +63,26 @@ export const Route = createFileRoute("/")({
   component: AirDraw,
 });
 
+
+type TrackerResults = { multiHandLandmarks?: Point[][] };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let sharedTrackerPromise: Promise<any> | null = null;
+let sharedResultsHandler: ((landmarks: Point[] | undefined) => void) | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getSharedTracker(): Promise<any> {
+  if (!sharedTrackerPromise) {
+    sharedTrackerPromise = (async () => {
+      const Hands = await loadHandsConstructor();
+      const tracker = new Hands({ locateFile: (file: string) => `/mediapipe/hands/${file}` });
+      tracker.setOptions({ maxNumHands: 1, modelComplexity: 0, selfieMode: false, minDetectionConfidence: 0.62, minTrackingConfidence: 0.58 });
+      tracker.onResults((results: TrackerResults) => sharedResultsHandler?.(results.multiHandLandmarks?.[0]));
+      await tracker.initialize();
+      return tracker;
+    })().catch((err) => { sharedTrackerPromise = null; throw err; });
+  }
+  return sharedTrackerPromise;
+}
+
 const EMPTY_OFFSET: FlyingOffset = { x: 0, y: 0, vx: 0, vy: 0 };
 
 function AirDraw() {
@@ -248,11 +268,11 @@ function AirDraw() {
       });
       await video.play();
 
-      const Hands = await loadHandsConstructor();
-      const tracker = new Hands({ locateFile: (file: string) => `/mediapipe/hands/${file}` });
-      tracker.setOptions({ maxNumHands: 1, modelComplexity: 0, selfieMode: false, minDetectionConfidence: 0.62, minTrackingConfidence: 0.58 });
-      tracker.onResults((results) => handleLandmarks(results.multiHandLandmarks[0]));
-      await tracker.initialize();
+      // Create the MediaPipe tracker only once per page. Its WASM runtime lives in
+      // a global `Module`; creating or closing a second instance makes it abort with
+      // "Module.arguments has been replaced with plain arguments_".
+      const tracker = await getSharedTracker();
+      sharedResultsHandler = (landmarks) => handleLandmarks(landmarks);
       trackerRef.current = tracker;
       setStatus("ready");
 
@@ -307,7 +327,8 @@ function AirDraw() {
   useEffect(() => () => {
     if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
     streamRef.current?.getTracks().forEach((track) => track.stop());
-    if (trackerRef.current) void trackerRef.current.close();
+    sharedResultsHandler = null;
+    trackerRef.current = null;
   }, []);
 
   const chooseMode = (next: Mode) => {
