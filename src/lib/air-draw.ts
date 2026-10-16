@@ -76,7 +76,7 @@ export class OneEuroPoint {
   private prev: Point | null = null;
   private dprev: Point = { x: 0, y: 0 };
   private lastT = 0;
-  constructor(private minCutoff = 1.4, private beta = 0.012, private dCutoff = 1) {}
+  constructor(private minCutoff = 1.2, private beta = 0.045, private dCutoff = 1) {}
   reset() { this.prev = null; this.dprev = { x: 0, y: 0 }; }
   private alpha(cutoff: number, dt: number) {
     const tau = 1 / (2 * Math.PI * cutoff);

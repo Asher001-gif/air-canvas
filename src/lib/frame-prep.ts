@@ -47,8 +47,18 @@ export class FramePrep {
     return `brightness(${this.gain.toFixed(2)}) contrast(${(1 + Math.min(0.3, (this.gain - 1) * 0.18)).toFixed(2)})`;
   }
 
+  /**
+   * Fast path: when the room is bright and no zoom-out is needed, the detector can read the
+   * <video> directly, skipping a full-frame canvas copy (saves a few ms of latency per frame).
+   * Always refreshes the brightness estimate. Returns null when `prepare` is needed instead.
+   */
+  passthrough(video: HTMLVideoElement, scale: number): HTMLVideoElement | null {
+    this.updateGain(video);
+    return scale === 1 && this.gain < 1.08 ? video : null;
+  }
+
   /** Returns the canvas to hand to the detector at the given zoom-out scale. */
-  prepare(video: HTMLVideoElement, scale: number): HTMLCanvasElement {
+  prepare(video: HTMLVideoElement, scale: number, gainUpdated = false): HTMLCanvasElement {
     const vw = video.videoWidth || 640;
     const vh = video.videoHeight || 480;
     const w = Math.min(640, vw);
@@ -57,7 +67,7 @@ export class FramePrep {
       this.feed.width = w;
       this.feed.height = h;
     }
-    this.updateGain(video);
+    if (!gainUpdated) this.updateGain(video);
     const ctx = this.feedCtx;
     ctx.save();
     ctx.filter = "none";

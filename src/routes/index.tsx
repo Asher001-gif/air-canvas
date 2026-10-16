@@ -82,9 +82,10 @@ function getSharedTracker(): Promise<any> {
     w.__airDrawTracker = (async () => {
       const Hands = await loadHandsConstructor();
       const tracker = new Hands({ locateFile: (file: string) => `/mediapipe/hands/${file}` });
-      // Low thresholds: the detector keeps following blurry, dim or partly cut-off hands
-      // instead of giving up. Two hands are allowed so an open second hand never hides the first.
-      tracker.setOptions({ maxNumHands: 2, modelComplexity: 1, selfieMode: false, minDetectionConfidence: 0.3, minTrackingConfidence: 0.3 });
+      // One hand only: half the compute (lower lag) and no second "ghost" hand to jump to.
+      // Confidence 0.5 rejects faces, sleeves and other things that merely look hand-like,
+      // which is what made the tracker point somewhere other than the real fingertip.
+      tracker.setOptions({ maxNumHands: 1, modelComplexity: 1, selfieMode: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
       tracker.onResults((results: TrackerResults) => sharedResultsHandler?.(results.multiHandLandmarks ?? []));
       await tracker.initialize();
       return tracker;
@@ -113,13 +114,14 @@ function AirDraw() {
   const scaleIdxRef = useRef(0);
   const missRef = useRef(0);
   const lastTipNormRef = useRef<Point | null>(null);
+  const motionRef = useRef<{ point: Point; time: number; vx: number; vy: number } | null>(null);
   const brushRef = useRef<BrushSize>("medium");
-  const assistRef = useRef(true);
+  const assistRef = useRef(false);
   const lowLightRef = useRef(false);
   const slowResultsRef = useRef(0);
   const liteModelRef = useRef(false);
   const [brush, setBrush] = useState<BrushSize>("medium");
-  const [assist, setAssist] = useState(true);
+  const [assist, setAssist] = useState(false);
   const [lowLight, setLowLight] = useState(false);
   const [mode, setMode] = useState<Mode>("draw");
   const [status, setStatus] = useState<Status>("idle");
@@ -207,6 +209,7 @@ function AirDraw() {
     const now = performance.now();
     if (!landmarks || landmarks.length < 21) {
       cursorRef.current = null;
+      motionRef.current = null;
       setHandVisible(false);
       recorderRef.current.lost(now);
       setStrokeCount(recorderRef.current.strokes.length);
@@ -239,6 +242,22 @@ function AirDraw() {
     } else {
       point = { x: (1 - tip.x) * rect.width, y: tip.y * rect.height };
     }
+    // Latency compensation: the camera frame is ~60-100 ms old by the time the detector
+    // answers, so the raw fingertip trails a moving finger. Push the point forward along
+    // the finger's smoothed velocity by roughly that delay (clamped so it can't overshoot).
+    const prevMotion = motionRef.current;
+    let vx = 0;
+    let vy = 0;
+    if (prevMotion && now - prevMotion.time < 150) {
+      const dt = Math.max((now - prevMotion.time) / 1000, 0.001);
+      vx = prevMotion.vx + 0.5 * ((point.x - prevMotion.point.x) / dt - prevMotion.vx);
+      vy = prevMotion.vy + 0.5 * ((point.y - prevMotion.point.y) / dt - prevMotion.vy);
+    }
+    motionRef.current = { point, time: now, vx, vy };
+    const lead = Math.min(0.09, recorderRef.current.frameInterval / 1000 + 0.04);
+    const lx = Math.max(-45, Math.min(45, vx * lead));
+    const ly = Math.max(-45, Math.min(45, vy * lead));
+    if (Math.hypot(lx, ly) > 1.5) point = { x: point.x + lx, y: point.y + ly };
     cursorRef.current = { point, drawing: false };
 
     if (modeRef.current === "draw") {
@@ -308,7 +327,9 @@ function AirDraw() {
     const video = videoRef.current;
     if (assistRef.current && modeRef.current === "draw" && missRef.current >= 3 && video && prepRef.current) {
       const tip = findFingertip(prepRef.current.sample(video));
-      if (tip) {
+      const lastTip = lastTipNormRef.current;
+      const nearLast = !tip || !lastTip || Math.hypot(tip.x - lastTip.x, tip.y - lastTip.y) < 0.3;
+      if (tip && nearLast) {
         handleLandmarks(syntheticPointingHand(tip));
         return;
       }
@@ -376,7 +397,8 @@ function AirDraw() {
           lastVideoTimeRef.current = liveVideo.currentTime;
           inFlightRef.current = true;
           const prep = prepRef.current ?? (prepRef.current = new FramePrep());
-          const feed = prep.prepare(liveVideo, DETECT_SCALES[scaleIdxRef.current] ?? 1);
+          const detectScale = DETECT_SCALES[scaleIdxRef.current] ?? 1;
+          const feed = prep.passthrough(liveVideo, detectScale) ?? prep.prepare(liveVideo, detectScale, true);
           const boosted = prep.brightnessGain > 1.3;
           if (boosted !== lowLightRef.current) { lowLightRef.current = boosted; setLowLight(boosted); }
           void activeTracker.send({ image: feed }).catch((err: unknown) => {
