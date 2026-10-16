@@ -1,19 +1,24 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Aperture, Camera, Check, Hand, LoaderCircle, LockKeyhole, RotateCcw, Sparkles, Trash2 } from "lucide-react";
+import { Aperture, Camera, Check, Hand, LoaderCircle, LockKeyhole, RotateCcw, Sparkles, Sun, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
+  BRUSH_WIDTHS,
+  StrokeRecorder,
   containsPoint,
   indexFingerIsExtended,
   isPinching,
-  isWithinTrackingGrace,
   moveDrawing,
   stepFlyingOffset,
+  syntheticPointingHand,
+  unscaleLandmarks,
+  type BrushSize,
   type DrawingBounds,
   type FlyingOffset,
   type Point,
-  TRACKING_GRACE_MS,
 } from "@/lib/air-draw";
+import { findFingertip } from "@/lib/fingertip-fallback";
+import { DETECT_SCALES, FramePrep } from "@/lib/frame-prep";
 
 // MediaPipe Hands is a classic (non-ES-module) script that attaches `Hands` to
 // `window`. Importing it as a module gives an undefined export once bundled
@@ -46,8 +51,7 @@ function loadHandsConstructor(): Promise<new (config: { locateFile: (file: strin
 
 type Mode = "draw" | "free";
 type Status = "idle" | "starting" | "ready" | "error";
-type Stroke = { points: Point[] };
-type HandsController = { send: (input: { image: HTMLVideoElement }) => Promise<void>; close: () => Promise<void> };
+type HandsController = { send: (input: { image: HTMLVideoElement | HTMLCanvasElement }) => Promise<void>; close: () => Promise<void> };
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -70,7 +74,7 @@ type AirDrawWindow = Window & {
   __airDrawTracker?: Promise<any> | null;
   __airDrawEngineBroken?: boolean;
 };
-let sharedResultsHandler: ((landmarks: Point[] | undefined) => void) | null = null;
+let sharedResultsHandler: ((hands: Point[][]) => void) | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function getSharedTracker(): Promise<any> {
   const w = window as AirDrawWindow;
@@ -78,8 +82,10 @@ function getSharedTracker(): Promise<any> {
     w.__airDrawTracker = (async () => {
       const Hands = await loadHandsConstructor();
       const tracker = new Hands({ locateFile: (file: string) => `/mediapipe/hands/${file}` });
-      tracker.setOptions({ maxNumHands: 1, modelComplexity: 0, selfieMode: false, minDetectionConfidence: 0.62, minTrackingConfidence: 0.58 });
-      tracker.onResults((results: TrackerResults) => sharedResultsHandler?.(results.multiHandLandmarks?.[0]));
+      // Low thresholds: the detector keeps following blurry, dim or partly cut-off hands
+      // instead of giving up. Two hands are allowed so an open second hand never hides the first.
+      tracker.setOptions({ maxNumHands: 2, modelComplexity: 1, selfieMode: false, minDetectionConfidence: 0.3, minTrackingConfidence: 0.3 });
+      tracker.onResults((results: TrackerResults) => sharedResultsHandler?.(results.multiHandLandmarks ?? []));
       await tracker.initialize();
       return tracker;
     })().catch((err) => { w.__airDrawTracker = null; w.__airDrawEngineBroken = true; throw err; });
@@ -96,17 +102,25 @@ function AirDraw() {
   const trackerRef = useRef<HandsController | null>(null);
   const frameRef = useRef<number | null>(null);
   const modeRef = useRef<Mode>("draw");
-  const strokesRef = useRef<Stroke[]>([]);
+  const recorderRef = useRef(new StrokeRecorder());
   const offsetRef = useRef<FlyingOffset>({ ...EMPTY_OFFSET });
-  const drawingRef = useRef(false);
-  const lastSeenRef = useRef(0);
-  const lastPointRef = useRef<Point | null>(null);
-  const filteredPointRef = useRef<Point | null>(null);
   const lastFrameTimeRef = useRef(0);
   const lastVideoTimeRef = useRef(-1);
   const inFlightRef = useRef(false);
   const cursorRef = useRef<{ point: Point; drawing: boolean } | null>(null);
   const dragRef = useRef<{ point: Point; time: number; vx: number; vy: number } | null>(null);
+  const prepRef = useRef<FramePrep | null>(null);
+  const scaleIdxRef = useRef(0);
+  const missRef = useRef(0);
+  const lastTipNormRef = useRef<Point | null>(null);
+  const brushRef = useRef<BrushSize>("medium");
+  const assistRef = useRef(true);
+  const lowLightRef = useRef(false);
+  const slowResultsRef = useRef(0);
+  const liteModelRef = useRef(false);
+  const [brush, setBrush] = useState<BrushSize>("medium");
+  const [assist, setAssist] = useState(true);
+  const [lowLight, setLowLight] = useState(false);
   const [mode, setMode] = useState<Mode>("draw");
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
@@ -132,17 +146,17 @@ function AirDraw() {
     context.translate(offsetRef.current.x, offsetRef.current.y);
     context.lineCap = "round";
     context.lineJoin = "round";
-    context.lineWidth = 4;
     context.strokeStyle = "#f7f8f5";
     context.shadowColor = "rgba(238, 255, 246, 0.72)";
-    context.shadowBlur = 14;
-    for (const stroke of strokesRef.current) {
+    for (const stroke of recorderRef.current.strokes) {
       const points = stroke.points;
       if (!points.length) continue;
+      context.lineWidth = stroke.width;
+      context.shadowBlur = 8 + stroke.width * 0.9;
       context.beginPath();
       context.moveTo(points[0]!.x, points[0]!.y);
       if (points.length === 1) {
-        context.lineTo(points[0]!.x + 0.1, points[0]!.y + 0.1);
+        context.lineTo(points[0]!.x + 0.1, points[0]!.y + 0.1); // dot: round cap gives it the brush width
       } else {
         for (let index = 1; index < points.length; index += 1) {
           const previous = points[index - 1]!;
@@ -177,7 +191,7 @@ function AirDraw() {
     let minY = Infinity;
     let maxX = -Infinity;
     let maxY = -Infinity;
-    for (const stroke of strokesRef.current) {
+    for (const stroke of recorderRef.current.strokes) {
       for (const point of stroke.points) {
         minX = Math.min(minX, point.x);
         minY = Math.min(minY, point.y);
@@ -194,10 +208,8 @@ function AirDraw() {
     if (!landmarks || landmarks.length < 21) {
       cursorRef.current = null;
       setHandVisible(false);
-      if (drawingRef.current && !isWithinTrackingGrace(lastSeenRef.current, now)) {
-        drawingRef.current = false;
-        lastPointRef.current = null;
-      }
+      recorderRef.current.lost(now);
+      setStrokeCount(recorderRef.current.strokes.length);
       if (dragRef.current) {
         dragRef.current = null;
         return;
@@ -230,35 +242,15 @@ function AirDraw() {
     cursorRef.current = { point, drawing: false };
 
     if (modeRef.current === "draw") {
-      const extended = indexFingerIsExtended(landmarks);
-      if (!extended) {
-        drawingRef.current = false;
-        lastPointRef.current = null;
-        filteredPointRef.current = null;
-        return;
-      }
-      if (!drawingRef.current || !isWithinTrackingGrace(lastSeenRef.current, now)) {
-        strokesRef.current.push({ points: [point] });
-        drawingRef.current = true;
-        filteredPointRef.current = point;
-        setStrokeCount(strokesRef.current.length);
-      } else {
-        const previous = filteredPointRef.current ?? point;
-        const filtered = { x: previous.x + (point.x - previous.x) * 0.38, y: previous.y + (point.y - previous.y) * 0.38 };
-        const stroke = strokesRef.current[strokesRef.current.length - 1];
-        if (stroke && Math.hypot(filtered.x - previous.x, filtered.y - previous.y) > 0.8) {
-          stroke.points.push(filtered);
-        }
-        filteredPointRef.current = filtered;
-      }
-      lastSeenRef.current = now;
-      lastPointRef.current = point;
-      if (cursorRef.current) cursorRef.current.drawing = true;
+      const recorder = recorderRef.current;
+      const extended = indexFingerIsExtended(landmarks, recorder.drawing);
+      recorder.track(point, extended, BRUSH_WIDTHS[brushRef.current], now);
+      setStrokeCount(recorder.strokes.length);
+      if (cursorRef.current) cursorRef.current.drawing = extended && recorder.drawing;
       return;
     }
 
-    drawingRef.current = false;
-    lastPointRef.current = null;
+    recorderRef.current.end(now);
     const bounds = getDrawingBounds();
     const pinching = isPinching(landmarks);
     if (pinching && !dragRef.current && bounds && containsPoint(bounds, { x: point.x - offsetRef.current.x, y: point.y - offsetRef.current.y })) {
@@ -277,6 +269,53 @@ function AirDraw() {
     }
   }, [getDrawingBounds]);
 
+  // Receives every detector result: picks the hand to follow, undoes the zoom-out
+  // used for close hands, and falls back to a fingertip-only finder when the
+  // detector can't see a palm.
+  const handleHands = useCallback((hands: Point[][]) => {
+    recorderRef.current.tick(performance.now());
+    // Slow computer? After ~20 sluggish results in a row, switch to the lighter model for a higher frame rate.
+    slowResultsRef.current = recorderRef.current.frameInterval > 90 ? slowResultsRef.current + 1 : 0;
+    if (slowResultsRef.current >= 20 && !liteModelRef.current) {
+      liteModelRef.current = true;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (trackerRef.current as any)?.setOptions?.({ modelComplexity: 0 });
+    }
+    const scale = DETECT_SCALES[scaleIdxRef.current] ?? 1;
+    if (hands.length) {
+      missRef.current = 0;
+      const mapped = hands.map((hand) => unscaleLandmarks(hand, scale));
+      const ref = lastTipNormRef.current;
+      let chosen = mapped[0]!;
+      if (ref && mapped.length > 1) {
+        const gap = (hand: Point[]) => Math.hypot((hand[8]?.x ?? 9) - ref.x, (hand[8]?.y ?? 9) - ref.y);
+        chosen = mapped.reduce((a, b) => (gap(a) <= gap(b) ? a : b));
+      }
+      lastTipNormRef.current = chosen[8] ?? null;
+      if (scale < 1) {
+        const xs = chosen.map((p) => p.x);
+        const ys = chosen.map((p) => p.y);
+        const span = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+        if (span < 0.4) scaleIdxRef.current = 0; // hand moved back: return to full-res detection
+      }
+      handleLandmarks(chosen);
+      return;
+    }
+    missRef.current += 1;
+    if (missRef.current > 12) lastTipNormRef.current = null;
+    // Lost for a couple of frames: retry zoomed out (a hand very close to the lens looks too big to the model).
+    if (missRef.current >= 2) scaleIdxRef.current = (scaleIdxRef.current + 1) % DETECT_SCALES.length;
+    const video = videoRef.current;
+    if (assistRef.current && modeRef.current === "draw" && missRef.current >= 3 && video && prepRef.current) {
+      const tip = findFingertip(prepRef.current.sample(video));
+      if (tip) {
+        handleLandmarks(syntheticPointingHand(tip));
+        return;
+      }
+    }
+    handleLandmarks(undefined);
+  }, [handleLandmarks]);
+
   const startCamera = useCallback(async () => {
     // The MediaPipe engine can't recover from a crash inside one page load, so reload.
     if ((window as AirDrawWindow).__airDrawEngineBroken) { window.location.reload(); return; }
@@ -293,7 +332,7 @@ function AirDraw() {
       }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 960 } },
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 960 }, frameRate: { ideal: 30 } },
       });
       streamRef.current = stream;
       const video = videoRef.current;
@@ -312,7 +351,10 @@ function AirDraw() {
       // a global `Module`; creating or closing a second instance makes it abort with
       // "Module.arguments has been replaced with plain arguments_".
       const tracker = await getSharedTracker();
-      sharedResultsHandler = (landmarks) => handleLandmarks(landmarks);
+      sharedResultsHandler = (hands) => handleHands(hands);
+      prepRef.current = new FramePrep();
+      scaleIdxRef.current = 0;
+      missRef.current = 0;
       trackerRef.current = tracker;
       setStatus("ready");
 
@@ -333,7 +375,11 @@ function AirDraw() {
         if (liveVideo && activeTracker && liveVideo.readyState >= 2 && liveVideo.currentTime !== lastVideoTimeRef.current && !inFlightRef.current) {
           lastVideoTimeRef.current = liveVideo.currentTime;
           inFlightRef.current = true;
-          void activeTracker.send({ image: liveVideo }).catch((err: unknown) => {
+          const prep = prepRef.current ?? (prepRef.current = new FramePrep());
+          const feed = prep.prepare(liveVideo, DETECT_SCALES[scaleIdxRef.current] ?? 1);
+          const boosted = prep.brightnessGain > 1.3;
+          if (boosted !== lowLightRef.current) { lowLightRef.current = boosted; setLowLight(boosted); }
+          void activeTracker.send({ image: feed }).catch((err: unknown) => {
             console.error("[air-draw] hand tracking failed", err);
             (window as AirDrawWindow).__airDrawEngineBroken = true;
             if (frameRef.current !== null) { cancelAnimationFrame(frameRef.current); frameRef.current = null; }
@@ -363,7 +409,7 @@ function AirDraw() {
             ? error.message
             : "Air Draw couldn’t start. Check your camera and try again.");
     }
-  }, [drawCanvas, getDrawingBounds, handleLandmarks]);
+  }, [drawCanvas, getDrawingBounds, handleHands]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -383,17 +429,14 @@ function AirDraw() {
   const chooseMode = (next: Mode) => {
     modeRef.current = next;
     setMode(next);
-    drawingRef.current = false;
-    lastPointRef.current = null;
-    filteredPointRef.current = null;
+    recorderRef.current.end(performance.now());
     dragRef.current = null;
     offsetRef.current = { ...offsetRef.current, vx: 0, vy: 0 };
   };
 
   const clearCanvas = () => {
-    strokesRef.current = [];
+    recorderRef.current.clear();
     offsetRef.current = { ...EMPTY_OFFSET };
-    drawingRef.current = false;
     dragRef.current = null;
     setStrokeCount(0);
     drawCanvas();
@@ -431,7 +474,7 @@ function AirDraw() {
               {status === "starting" ? "Opening camera…" : status === "error" ? "Retry camera" : "Start drawing"}
             </Button>
           </div>}
-          {status === "ready" && <div className="stage-caption"><span className="caption-signal" />{handVisible ? "Tracking your hand" : "Waiting for your hand"}</div>}
+          {status === "ready" && <div className="stage-caption"><span className="caption-signal" />{handVisible ? "Tracking your hand" : "Waiting for your hand"}{lowLight ? " · low-light boost on" : ""}</div>}
           <div className="stage-index">{String(strokeCount).padStart(2, "0")} <span>STROKES</span></div>
         </div>
 
@@ -440,9 +483,17 @@ function AirDraw() {
             <Button variant={mode === "draw" ? "default" : "ghost"} className={`mode-button ${mode === "draw" ? "mode-active" : ""}`} onClick={() => chooseMode("draw")} aria-pressed={mode === "draw"}><Sparkles size={16} />Draw</Button>
             <Button variant={mode === "free" ? "default" : "ghost"} className={`mode-button ${mode === "free" ? "mode-active" : ""}`} onClick={() => chooseMode("free")} aria-pressed={mode === "free"}><Hand size={16} />Free</Button>
             <span className="control-divider" />
+            {(["thin", "medium", "thick"] as BrushSize[]).map((size) => (
+              <Button key={size} variant="ghost" className={`mode-button brush-button ${brush === size ? "mode-active" : ""}`} onClick={() => { brushRef.current = size; setBrush(size); }} aria-pressed={brush === size} aria-label={`${size} brush`}>
+                <span className="brush-swatch" style={{ height: BRUSH_WIDTHS[size] }} />{size}
+              </Button>
+            ))}
+            <span className="control-divider" />
+            <Button variant="ghost" className={`mode-button ${assist ? "mode-active" : ""}`} onClick={() => { assistRef.current = !assist; setAssist(!assist); }} aria-pressed={assist} title="Track a lone fingertip when your whole hand is too close for the camera"><Sun size={16} />Close-up assist</Button>
+            <span className="control-divider" />
             <Button variant="ghost" className="mode-button clear-button" onClick={clearCanvas}><Trash2 size={16} />Clear</Button>
           </div>
-          <div className="mode-hint">{mode === "draw" ? <><span>INDEX</span> finger up to draw · fold to finish</> : <><span>PINCH</span> a stroke to grab · release to throw</>}</div>
+          <div className="mode-hint">{mode === "draw" ? <><span>INDEX</span> fingertip draws, even with an open hand · curl it to lift</> : <><span>PINCH</span> a stroke to grab · release to throw</>}</div>
         </div>
 
         <div className="studio-footer"><div className="footer-rule" /><p><Check size={13} /> Nothing is recorded or uploaded.</p><div className="footer-rule" /></div>

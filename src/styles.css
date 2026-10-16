@@ -197,6 +197,9 @@
 .control-divider { width: 1px; height: 20px; margin: 0 7px; background: var(--border); }
 .clear-button { color: var(--muted-foreground); }
 .clear-button:hover { color: oklch(0.76 0.16 27); }
+.mode-controls { flex-wrap: wrap; }
+.brush-button { gap: 8px; text-transform: capitalize; }
+.brush-swatch { display: inline-block; width: 18px; border-radius: 99px; background: currentColor; }
 .mode-hint { color: var(--muted-foreground); font-size: 11px; text-align: right; }
 .mode-hint span { margin-right: 8px; color: var(--primary); font-size: 9px; font-weight: 650; letter-spacing: 1px; }
 .studio-footer { display: flex; align-items: center; gap: 14px; padding: 19px 0 0; }

@@ -8,13 +8,19 @@ Controls: three normal on-screen buttons (Draw, Free, Clear) that you click with
 
 Draw mode
 
-Extending your index finger draws a stroke under your fingertip. Folding it ends the stroke.
+Your index fingertip draws a stroke, even with the whole hand open. Curling the finger lifts the pen (after a ~120 ms debounce so one bad frame can't cut a line).
 
-Strokes are white with a soft glow, at medium thickness.
+Brush: Thin / Medium / Thick buttons set the stroke width.
 
-Light smoothing keeps lines clean without feeling laggy.
+Strokes are white with a soft glow. A One Euro filter smooths jitter when you move slowly and stays responsive when you move fast; gaps between samples are filled in so lines never break up.
 
-If tracking drops briefly, the stroke bridges the gap for about 150 ms, then ends.
+If tracking drops (blur, dim light, hand too close), the stroke stays open for at least 500 ms (longer on slow computers, scaled to the measured frame rate) and continues when the fingertip returns.
+
+Hard conditions
+- Dim rooms: frames get an automatic brightness/contrast lift before detection ("low-light boost on" shows in the caption).
+- Hand too close: when detection fails, the detector retries on a zoomed-out copy of the frame.
+- Only a fingertip visible (no palm): "Close-up assist" finds the skin-coloured finger entering from the bottom of the frame. Turn it off if it picks up your face or a skin-toned background.
+- Slow computers: if results arrive slowly the app switches to the lighter model automatically.
 
 Free mode
 
