@@ -85,7 +85,7 @@ function getSharedTracker(): Promise<any> {
       // One hand only: half the compute (lower lag) and no second "ghost" hand to jump to.
       // Confidence 0.5 rejects faces, sleeves and other things that merely look hand-like,
       // which is what made the tracker point somewhere other than the real fingertip.
-      tracker.setOptions({ maxNumHands: 1, modelComplexity: 1, selfieMode: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      tracker.setOptions({ maxNumHands: 1, modelComplexity: 0, selfieMode: false, minDetectionConfidence: 0.4, minTrackingConfidence: 0.4 });
       tracker.onResults((results: TrackerResults) => sharedResultsHandler?.(results.multiHandLandmarks ?? []));
       await tracker.initialize();
       return tracker;
@@ -119,7 +119,14 @@ function AirDraw() {
   const assistRef = useRef(false);
   const lowLightRef = useRef(false);
   const slowResultsRef = useRef(0);
-  const liteModelRef = useRef(false);
+  const complexityRef = useRef<0 | 1>(0);
+  const fastResultsRef = useRef(0);
+  const triedFullRef = useRef(false);
+  const fpsStampRef = useRef(0);
+  const debugPointsRef = useRef<Point[] | null>(null);
+  const showTrackRef = useRef(true);
+  const [showTrack, setShowTrack] = useState(true);
+  const [fps, setFps] = useState(0);
   const [brush, setBrush] = useState<BrushSize>("medium");
   const [assist, setAssist] = useState(false);
   const [lowLight, setLowLight] = useState(false);
@@ -175,6 +182,18 @@ function AirDraw() {
       context.stroke();
     }
     context.restore();
+    const dots = debugPointsRef.current;
+    if (dots && showTrackRef.current) {
+      context.save();
+      context.shadowBlur = 0;
+      dots.forEach((p, i) => {
+        context.fillStyle = i === 8 ? "#ff4d6d" : "rgba(125,255,178,0.85)";
+        context.beginPath();
+        context.arc(p.x, p.y, i === 8 ? 4 : 2.2, 0, Math.PI * 2);
+        context.fill();
+      });
+      context.restore();
+    }
     const cursor = cursorRef.current;
     if (cursor) {
       context.save();
@@ -205,11 +224,12 @@ function AirDraw() {
     return { minX, minY, maxX, maxY };
   }, []);
 
-  const handleLandmarks = useCallback((landmarks: Point[] | undefined) => {
+  const handleLandmarks = useCallback((landmarks: Point[] | undefined, real = true) => {
     const now = performance.now();
     if (!landmarks || landmarks.length < 21) {
       cursorRef.current = null;
       motionRef.current = null;
+      debugPointsRef.current = null;
       setHandVisible(false);
       recorderRef.current.lost(now);
       setStrokeCount(recorderRef.current.strokes.length);
@@ -231,17 +251,19 @@ function AirDraw() {
     const video = videoRef.current;
     const vw = video?.videoWidth || 0;
     const vh = video?.videoHeight || 0;
-    let point: Point;
-    if (vw && vh && rect.width && rect.height) {
-      const scale = Math.max(rect.width / vw, rect.height / vh);
-      const shownW = vw * scale;
-      const shownH = vh * scale;
-      const offsetX = (rect.width - shownW) / 2;
-      const offsetY = (rect.height - shownH) / 2;
-      point = { x: rect.width - (tip.x * shownW + offsetX), y: tip.y * shownH + offsetY };
-    } else {
-      point = { x: (1 - tip.x) * rect.width, y: tip.y * rect.height };
-    }
+    const toScreen = (p: Point): Point => {
+      if (vw && vh && rect.width && rect.height) {
+        const scale = Math.max(rect.width / vw, rect.height / vh);
+        const shownW = vw * scale;
+        const shownH = vh * scale;
+        const offsetX = (rect.width - shownW) / 2;
+        const offsetY = (rect.height - shownH) / 2;
+        return { x: rect.width - (p.x * shownW + offsetX), y: p.y * shownH + offsetY };
+      }
+      return { x: (1 - p.x) * rect.width, y: p.y * rect.height };
+    };
+    let point = toScreen(tip);
+    debugPointsRef.current = real ? landmarks.map(toScreen) : null;
     // Latency compensation: the camera frame is ~60-100 ms old by the time the detector
     // answers, so the raw fingertip trails a moving finger. Push the point forward along
     // the finger's smoothed velocity by roughly that delay (clamped so it can't overshoot).
@@ -254,7 +276,9 @@ function AirDraw() {
       vy = prevMotion.vy + 0.5 * ((point.y - prevMotion.point.y) / dt - prevMotion.vy);
     }
     motionRef.current = { point, time: now, vx, vy };
-    const lead = Math.min(0.09, recorderRef.current.frameInterval / 1000 + 0.04);
+    // Only extrapolate when results arrive quickly; with slow results the guess is too wild.
+    const interval = recorderRef.current.frameInterval;
+    const lead = interval < 70 ? Math.min(0.06, interval / 1000 + 0.03) : 0;
     const lx = Math.max(-45, Math.min(45, vx * lead));
     const ly = Math.max(-45, Math.min(45, vy * lead));
     if (Math.hypot(lx, ly) > 1.5) point = { x: point.x + lx, y: point.y + ly };
@@ -293,13 +317,22 @@ function AirDraw() {
   // detector can't see a palm.
   const handleHands = useCallback((hands: Point[][]) => {
     recorderRef.current.tick(performance.now());
-    // Slow computer? After ~20 sluggish results in a row, switch to the lighter model for a higher frame rate.
-    slowResultsRef.current = recorderRef.current.frameInterval > 90 ? slowResultsRef.current + 1 : 0;
-    if (slowResultsRef.current >= 20 && !liteModelRef.current) {
-      liteModelRef.current = true;
+    // Adaptive model size: start on the fast lite model; if the computer keeps up (30+ fps),
+    // try the more accurate one; if that turns sluggish, drop back to lite.
+    const interval = recorderRef.current.frameInterval;
+    slowResultsRef.current = interval > 90 ? slowResultsRef.current + 1 : 0;
+    fastResultsRef.current = interval < 40 ? fastResultsRef.current + 1 : 0;
+    const switchComplexity = (c: 0 | 1) => {
+      complexityRef.current = c;
+      slowResultsRef.current = 0;
+      fastResultsRef.current = 0;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (trackerRef.current as any)?.setOptions?.({ modelComplexity: 0 });
-    }
+      (trackerRef.current as any)?.setOptions?.({ modelComplexity: c });
+    };
+    if (complexityRef.current === 1 && slowResultsRef.current >= 20) switchComplexity(0);
+    else if (complexityRef.current === 0 && !triedFullRef.current && fastResultsRef.current >= 150) { triedFullRef.current = true; switchComplexity(1); }
+    const nowMs = performance.now();
+    if (nowMs - fpsStampRef.current > 500) { fpsStampRef.current = nowMs; setFps(Math.round(1000 / Math.max(interval, 1))); }
     const scale = DETECT_SCALES[scaleIdxRef.current] ?? 1;
     if (hands.length) {
       missRef.current = 0;
@@ -330,7 +363,7 @@ function AirDraw() {
       const lastTip = lastTipNormRef.current;
       const nearLast = !tip || !lastTip || Math.hypot(tip.x - lastTip.x, tip.y - lastTip.y) < 0.3;
       if (tip && nearLast) {
-        handleLandmarks(syntheticPointingHand(tip));
+        handleLandmarks(syntheticPointingHand(tip), false);
         return;
       }
     }
@@ -496,7 +529,7 @@ function AirDraw() {
               {status === "starting" ? "Opening camera…" : status === "error" ? "Retry camera" : "Start drawing"}
             </Button>
           </div>}
-          {status === "ready" && <div className="stage-caption"><span className="caption-signal" />{handVisible ? "Tracking your hand" : "Waiting for your hand"}{lowLight ? " · low-light boost on" : ""}</div>}
+          {status === "ready" && <div className="stage-caption"><span className="caption-signal" />{handVisible ? "Tracking your hand" : "Waiting for your hand"} · {fps} fps{lowLight ? " · low-light boost on" : ""}</div>}
           <div className="stage-index">{String(strokeCount).padStart(2, "0")} <span>STROKES</span></div>
         </div>
 
@@ -512,6 +545,8 @@ function AirDraw() {
             ))}
             <span className="control-divider" />
             <Button variant="ghost" className={`mode-button ${assist ? "mode-active" : ""}`} onClick={() => { assistRef.current = !assist; setAssist(!assist); }} aria-pressed={assist} title="Track a lone fingertip when your whole hand is too close for the camera"><Sun size={16} />Close-up assist</Button>
+            <span className="control-divider" />
+            <Button variant="ghost" className={`mode-button ${showTrack ? "mode-active" : ""}`} onClick={() => { showTrackRef.current = !showTrack; setShowTrack(!showTrack); }} aria-pressed={showTrack} title="Show the dots the tracker sees on your hand"><Hand size={16} />Show tracking</Button>
             <span className="control-divider" />
             <Button variant="ghost" className="mode-button clear-button" onClick={clearCanvas}><Trash2 size={16} />Clear</Button>
           </div>
